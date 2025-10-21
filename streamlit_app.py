@@ -315,7 +315,7 @@ class AIAgent:
         # Initialize LangChain for cloud LLM
         try:
             self.llm = HuggingFaceEndpoint(
-                repo_id="google/gemma-2-2b-it",
+                repo_id="google/gemma-2b-it",
                 huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
                 temperature=0.7,
                 max_new_tokens=512
