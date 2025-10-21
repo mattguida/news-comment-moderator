@@ -315,16 +315,16 @@ class AIAgent:
         # Initialize LangChain for cloud LLM
         try:
             self.llm = HuggingFaceEndpoint(
-                repo_id="google/gemma-2b-it",
+                repo_id="google/gemma-2-2b-it",
                 huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
                 temperature=0.7,
-                max_new_tokens=512
+                max_new_tokens=512,
+                task="conversational"
             )
             st.success("Gemma 2B LLM initialized successfully")
         except Exception as e:
             st.warning(f"Gemma LLM initialization failed: {e}. Check HUGGINGFACE_API_TOKEN.")
             self.llm = None
-
 
 
     def _classify_frames(self, text_list: List[str]) -> List[List[Tuple[str, float]]]:
