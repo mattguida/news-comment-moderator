@@ -315,14 +315,14 @@ class AIAgent:
         # Initialize LangChain for cloud LLM
         try:
             self.llm = HuggingFaceEndpoint(
-                repo_id="mistralai/Mistral-7B-Instruct-v0.1",
+                repo_id="google/gemma-2b-it",
                 huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
                 temperature=0.7,
                 max_new_tokens=512
             )
-            st.success("Cloud LLM initialized successfully")
+            st.success("Gemma 2B LLM initialized successfully")
         except Exception as e:
-            st.warning(f"Cloud LLM initialization failed: {e}. Using local Ollama if available.")
+            st.warning(f"Gemma LLM initialization failed: {e}. Check HUGGINGFACE_API_TOKEN.")
             self.llm = None
 
 
