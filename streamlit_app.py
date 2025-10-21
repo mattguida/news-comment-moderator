@@ -281,11 +281,6 @@ class AIAgent:
 
     def __init__(self):
         self.perspective_api_key = os.getenv('PERSPECTIVE_API_KEY', 'AIzaSyC2GXct-IoB8Rw43rp4G3yROnb5TSreS8I')
-        self.ollama_url = os.getenv('OLLAMA_URL', "http://localhost:11434/api/generate")
-        self.model_name = os.getenv('OLLAMA_MODEL', "mistral")
-
-        # Check and start Ollama if needed
-        self._ensure_ollama_running()
 
         # Hugging Face Model setup - detect best available device
         if torch.cuda.is_available():
@@ -330,70 +325,7 @@ class AIAgent:
             st.warning(f"Cloud LLM initialization failed: {e}. Using local Ollama if available.")
             self.llm = None
 
-    def _ensure_ollama_running(self):
-        """Check if Ollama is running and try to start it if not"""
-        st.info("Checking Ollama status...")
 
-        # First check if Ollama is already running
-        try:
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
-            if response.status_code == 200:
-                st.success("✅ Ollama is already running")
-                models = response.json().get('models', [])
-                model_names = [model['name'] for model in models]
-                st.info(f"Available models: {model_names}")
-                if any(name == self.model_name or name.startswith(self.model_name) for name in model_names):
-                    st.success(f"✅ {self.model_name} model is available")
-                    return
-                else:
-                    st.warning(f"⚠️  {self.model_name} model not found, attempting to pull...")
-                    self._pull_model(self.model_name)
-                    return
-        except requests.exceptions.RequestException:
-            st.warning("❌ Ollama is not running, attempting to start...")
-
-        # Try to start Ollama
-        try:
-            st.info("Starting Ollama server...")
-            process = subprocess.Popen(['ollama', 'serve'],
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE,
-                                     start_new_session=True)
-
-            time.sleep(3)
-
-            try:
-                response = requests.get("http://localhost:11434/api/tags", timeout=5)
-                if response.status_code == 200:
-                    st.success("✅ Ollama started successfully")
-                    self._pull_model(self.model_name)
-                    return
-            except requests.exceptions.RequestException:
-                st.error("❌ Failed to start Ollama automatically")
-
-        except FileNotFoundError:
-            st.error("❌ Ollama command not found. Please install Ollama: https://ollama.ai/")
-        except Exception as e:
-            st.error(f"❌ Error starting Ollama: {e}")
-
-        st.warning("⚠️  Ollama setup incomplete. LLM features will not work until Ollama is running with mistral model.")
-
-    def _pull_model(self, model_name: str):
-        """Pull the specified model if not available"""
-        try:
-            st.info(f"Pulling {model_name} model...")
-            process = subprocess.run(['ollama', 'pull', model_name],
-                                   capture_output=True, text=True, timeout=300)
-            if process.returncode == 0:
-                st.success(f"✅ {model_name} model pulled successfully")
-            else:
-                st.error(f"❌ Failed to pull {model_name} model: {process.stderr}")
-        except subprocess.TimeoutExpired:
-            st.error(f"❌ Timeout pulling {model_name} model")
-        except FileNotFoundError:
-            st.error("❌ Ollama command not found")
-        except Exception as e:
-            st.error(f"❌ Error pulling {model_name} model: {e}")
 
     def _classify_frames(self, text_list: List[str]) -> List[List[Tuple[str, float]]]:
         """Classify frames for a list of sentences"""
@@ -452,32 +384,16 @@ class AIAgent:
         return scores
 
     def _call_llm(self, prompt: str) -> str:
-        """Call LLM for suggestions - try cloud first, then local"""
-        # Try cloud LLM first
-        if self.llm:
-            try:
-                response = self.llm.invoke(prompt)
-                return response
-            except Exception as e:
-                st.warning(f"Cloud LLM failed: {e}. Trying local Ollama...")
+        """Call HuggingFace cloud LLM for suggestions"""
+        if not self.llm:
+            st.error("LLM not initialized. Please set HUGGINGFACE_API_TOKEN.")
+            return ""
 
-        # Fallback to local Ollama
         try:
-            payload = {
-                "model": self.model_name,
-                "prompt": prompt,
-                "format": "json",
-                "stream": False
-            }
-            response = requests.post(self.ollama_url, json=payload, timeout=45)
-            if response.status_code == 200:
-                result = response.json()
-                return result.get('response', '')
-            else:
-                st.error(f"Ollama error: {response.status_code} - {response.text}")
-                return ""
+            response = self.llm.invoke(prompt)
+            return response
         except Exception as e:
-            st.error(f"LLM error: {e}")
+            st.error(f"LLM call failed: {e}")
             return ""
 
     def analyze_article(self, article_text: str) -> Dict:
