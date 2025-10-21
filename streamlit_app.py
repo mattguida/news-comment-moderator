@@ -316,7 +316,7 @@ class AIAgent:
         try:
             self.llm = HuggingFaceEndpoint(
                 repo_id="google/gemma-2b-it",
-                huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
+                huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN', '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'),
                 temperature=0.7,
                 max_new_tokens=512
             )
