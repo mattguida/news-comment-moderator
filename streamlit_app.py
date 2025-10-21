@@ -27,13 +27,9 @@ from langchain_huggingface import HuggingFaceEndpoint
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
-# Download sentence tokenizer
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-
 from nltk.tokenize import sent_tokenize
+nltk.download('punkt_tab')
+
 
 # ============================================
 # CONFIGURATION
