@@ -386,14 +386,30 @@ class AIAgent:
     def _call_llm(self, prompt: str) -> str:
         """Call HuggingFace cloud LLM for suggestions"""
         if not self.llm:
-            st.error("LLM not initialized. Please set HUGGINGFACE_API_TOKEN.")
+            st.error("LLM not initialized. Please set HUGGINGFACE_API_TOKEN environment variable.")
+            return ""
+
+        # Check if API token is available
+        token = os.getenv('HUGGINGFACE_API_TOKEN')
+        if not token:
+            st.error("HUGGINGFACE_API_TOKEN environment variable is not set.")
             return ""
 
         try:
+            # Log for debugging (remove in production)
+            st.info(f"Calling Gemma LLM with prompt length: {len(prompt)} characters")
+
             response = self.llm.invoke(prompt)
+
+            if not response or response.strip() == "":
+                st.warning("LLM returned empty response")
+                return ""
+
             return response
+
         except Exception as e:
-            st.error(f"LLM call failed: {e}")
+            st.error(f"LLM call failed: {str(e)}")
+            st.error("This might be due to: 1) Invalid API token, 2) Model unavailable, 3) Rate limiting, or 4) Network issues")
             return ""
 
     def analyze_article(self, article_text: str) -> Dict:
