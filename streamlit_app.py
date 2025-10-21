@@ -1,0 +1,867 @@
+"""
+Streamlit App for AI Comment Moderation Agent
+Deploy on Streamlit Cloud: https://share.streamlit.io/
+"""
+
+import streamlit as st
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import requests
+import os
+from typing import Dict, List, Tuple
+from enum import Enum
+import nltk
+import json
+import re
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import time
+import subprocess
+from datetime import datetime, timedelta
+from scipy.spatial.distance import cosine
+from pydantic import BaseModel
+from typing import List as TypingList
+
+# LangChain imports for cloud LLM
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+
+# Download sentence tokenizer
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+
+from nltk.tokenize import sent_tokenize
+
+# ============================================
+# CONFIGURATION
+# ============================================
+
+class FrameType(Enum):
+    ECONOMIC = "Economic"
+    MORALITY = "Morality"
+    FAIRNESS_EQUALITY = "Fairness and Equality"
+    LEGALITY_CRIME = "Legality and Crime"
+    POLITICAL_POLICIES = "Political and Policies"
+    SECURITY_DEFENSE = "Security and Defense"
+    HEALTH_SAFETY = "Health and Safety"
+    CULTURAL_IDENTITY = "Cultural Identity"
+    PUBLIC_OPINION = "Public Opinion"
+    OTHER = "None/Other"
+
+class ReframingType(Enum):
+    RETENTION = "Frame Retention"
+    SELECTIVE = "Selective Reframe"
+    COMPLETE = "Complete Reframe"
+
+class LLMInterventionResponse(BaseModel):
+    risk_level: str
+    suggestions: TypingList[str]
+    allow_post: bool
+
+# ============================================
+# NEWS SCRAPING INTEGRATION
+# ============================================
+
+class NewsScraperClient:
+    """
+    Scrape real news articles from various news websites without API keys
+    """
+
+    def __init__(self):
+        self.article_cache = {}
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
+
+        # News sources to scrape (no API keys needed)
+        self.news_sources = {
+            'bbc': {
+                'url': 'https://www.bbc.com/news',
+                'article_selector': 'a[href*="/news/"]:not([href*="live"]):not([href*="video"])',
+                'title_selector': 'h1',
+                'content_selector': '[data-component="text-block"], .article-body p, .ssrcss-uf6wea-RichTextComponentWrapper p, p[data-reactroot], .article__body p',
+                'base_url': 'https://www.bbc.com'
+            },
+        }
+
+    def fetch_articles(self, categories: List[str] = None, limit: int = 10) -> List[Dict]:
+        """Fetch recent news articles by scraping news websites"""
+        try:
+            articles = self._scrape_bbc_articles()
+        except Exception as e:
+            st.error(f"Error scraping articles: {e}")
+            articles = self._get_demo_articles()
+
+        # Simple category filter
+        if categories:
+            category_keywords = {
+                'politics': ['politics', 'government', 'election', 'policy'],
+                'health': ['health', 'medical', 'covid', 'disease'],
+                'science': ['science', 'research', 'study', 'discovery'],
+                'environment': ['climate', 'environment', 'green', 'sustainability'],
+                'economy': ['economy', 'economic', 'business', 'finance']
+            }
+            filtered_articles = []
+            for article in articles:
+                text = (article.get('title', '') + ' ' + article.get('content', '')).lower()
+                for cat in categories:
+                    if any(keyword in text for keyword in category_keywords.get(cat, [cat])):
+                        filtered_articles.append(article)
+                        break
+            articles = filtered_articles
+
+        # Cache articles
+        for article in articles:
+            self.article_cache[article['id']] = article
+
+        return articles[:limit]
+
+    def search_articles(self, query: str, limit: int = 10) -> List[Dict]:
+        """Search for articles by scraping search results"""
+        try:
+            articles = self._scrape_bbc_search(query)
+        except Exception as e:
+            st.error(f"Error scraping search results: {e}")
+            articles = self._get_demo_articles()
+            query_lower = query.lower()
+            articles = [a for a in articles if query_lower in a['title'].lower() or query_lower in a['content'].lower()]
+
+        # Cache articles
+        for article in articles:
+            self.article_cache[article['id']] = article
+
+        return articles[:limit]
+
+    def get_article(self, article_id: str) -> Dict:
+        """Get article from cache"""
+        return self.article_cache.get(article_id)
+
+    def _scrape_bbc_articles(self) -> List[Dict]:
+        """Scrape articles from BBC News"""
+        try:
+            response = self.session.get('https://www.bbc.com/news')
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'lxml')
+
+            articles = []
+            article_links = soup.select('a[href*="/news/"]:not([href*="live"]):not([href*="video"])')
+
+            for link in article_links[:20]:
+                href = link.get('href')
+                if not href.startswith('http'):
+                    href = urljoin('https://www.bbc.com', href)
+
+                # Skip if already processed
+                article_id = href.split('/')[-1] if '/' in href else str(hash(href))
+                if article_id in self.article_cache:
+                    continue
+
+                try:
+                    # Fetch individual article
+                    article_response = self.session.get(href)
+                    article_response.raise_for_status()
+                    article_soup = BeautifulSoup(article_response.content, 'lxml')
+
+                    title = article_soup.select_one('h1')
+                    title = title.get_text().strip() if title else "No Title"
+
+                    content_divs = article_soup.select('[data-component="text-block"], .article-body p, .ssrcss-uf6wea-RichTextComponentWrapper p, p[data-reactroot], .article__body p')
+                    content = ' '.join([div.get_text().strip() for div in content_divs if div.get_text().strip()])
+
+                    if content and len(content) > 100:
+                        article = {
+                            'id': article_id,
+                            'title': title,
+                            'content': content,
+                            'source': 'BBC News',
+                            'url': href,
+                            'published_at': datetime.now().isoformat(),
+                            'categories': []
+                        }
+                        articles.append(article)
+
+                except Exception as e:
+                    st.warning(f"Error scraping article {href}: {e}")
+                    continue
+
+            return articles
+
+        except Exception as e:
+            st.error(f"Error scraping BBC: {e}")
+            raise
+
+    def _scrape_bbc_search(self, query: str) -> List[Dict]:
+        """Scrape BBC search results for a query - optimized for 3 articles"""
+        try:
+            search_url = f'https://www.bbc.co.uk/search?q={query}&filter=news'
+            response = self.session.get(search_url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.content, 'lxml')
+
+            articles = []
+            search_results = soup.select('a[href*="/news/"]:not([href*="live"]):not([href*="video"])')[:6]
+
+            for link in search_results:
+                if len(articles) >= 3:
+                    break
+
+                href = link.get('href')
+                if not href.startswith('http'):
+                    href = urljoin('https://www.bbc.co.uk', href)
+
+                article_id = href.split('/')[-1] if '/' in href else str(hash(href))
+                if article_id in self.article_cache:
+                    continue
+
+                try:
+                    article_response = self.session.get(href, timeout=10)
+                    article_response.raise_for_status()
+                    article_soup = BeautifulSoup(article_response.content, 'lxml')
+
+                    title = article_soup.select_one('h1')
+                    title = title.get_text().strip() if title else "No Title"
+
+                    content_divs = article_soup.select('[data-component="text-block"], .article-body p, .ssrcss-uf6wea-RichTextComponentWrapper p, p[data-reactroot], .article__body p')
+                    content = ' '.join([div.get_text().strip() for div in content_divs if div.get_text().strip()])
+
+                    if content and len(content) > 200:
+                        article = {
+                            'id': article_id,
+                            'title': title,
+                            'content': content,
+                            'source': 'BBC News',
+                            'url': href,
+                            'published_at': datetime.now().isoformat(),
+                            'categories': []
+                        }
+                        articles.append(article)
+
+                except Exception as e:
+                    st.warning(f"Error scraping search result article {href}: {e}")
+                    continue
+
+            return articles[:3]
+
+        except Exception as e:
+            st.error(f"Error scraping BBC search: {e}")
+            raise
+
+    def _get_demo_articles(self) -> List[Dict]:
+        """Demo articles for fallback when scraping fails"""
+        return [
+            {
+                'id': 'demo1',
+                'title': 'Sample News Article 1',
+                'content': 'This is a sample article content for testing purposes. It contains some text about current events and political discussions.',
+                'source': 'Demo News',
+                'url': 'https://example.com/demo1',
+                'published_at': datetime.now().isoformat(),
+                'categories': ['politics']
+            },
+            {
+                'id': 'demo2',
+                'title': 'Sample News Article 2',
+                'content': 'Another sample article discussing economic policies and their impact on society. This includes various viewpoints on fiscal matters.',
+                'source': 'Demo News',
+                'url': 'https://example.com/demo2',
+                'published_at': datetime.now().isoformat(),
+                'categories': ['economy']
+            }
+        ]
+
+# ============================================
+# AI AGENT COMPONENTS
+# ============================================
+
+class AIAgent:
+    """
+    The AI agent with toxicity detection and LLM-based constructive suggestions
+    """
+    FRAME_MODEL = "mattdr/sentence-frame-classifier"
+
+    def __init__(self):
+        self.perspective_api_key = os.getenv('PERSPECTIVE_API_KEY', 'AIzaSyC2GXct-IoB8Rw43rp4G3yROnb5TSreS8I')
+        self.ollama_url = os.getenv('OLLAMA_URL', "http://localhost:11434/api/generate")
+        self.model_name = os.getenv('OLLAMA_MODEL', "mistral")
+
+        # Check and start Ollama if needed
+        self._ensure_ollama_running()
+
+        # Hugging Face Model setup - detect best available device
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            st.info("Using CUDA GPU acceleration")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            st.info("Using Apple MPS")
+        else:
+            self.device = torch.device("cpu")
+            st.info("Using CPU (no GPU acceleration available)")
+
+        # Add try-except for robust loading
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.FRAME_MODEL)
+            self.model = AutoModelForSequenceClassification.from_pretrained(self.FRAME_MODEL, num_labels=len(FrameType))
+            self.model.to(self.device)
+            self.model.eval()
+        except Exception as e:
+            st.error(f"ERROR LOADING HF MODEL: {e}. Frame classification will be mocked.")
+            self.tokenizer = None
+            self.model = None
+
+        # Map model labels to FrameType (Crucial for a real model, mocked/guessed here)
+        self.label_map = {i: frame.value for i, frame in enumerate(FrameType)}
+
+        if self.model and self.model.config.id2label:
+            hf_labels = list(self.model.config.id2label.values())
+            self.label_map = {i: next((ft.value for ft in FrameType if ft.value.lower().startswith(hf_labels[i].split('_')[0].lower())), FrameType.OTHER.value) for i in range(len(hf_labels))}
+            st.info(f"Using HuggingFace label map: {self.label_map}")
+
+        # Initialize LangChain for cloud LLM
+        try:
+            self.llm = HuggingFaceEndpoint(
+                repo_id="mistralai/Mistral-7B-Instruct-v0.1",
+                huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
+                temperature=0.7,
+                max_new_tokens=512
+            )
+            st.success("Cloud LLM initialized successfully")
+        except Exception as e:
+            st.warning(f"Cloud LLM initialization failed: {e}. Using local Ollama if available.")
+            self.llm = None
+
+    def _ensure_ollama_running(self):
+        """Check if Ollama is running and try to start it if not"""
+        st.info("Checking Ollama status...")
+
+        # First check if Ollama is already running
+        try:
+            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+            if response.status_code == 200:
+                st.success("✅ Ollama is already running")
+                models = response.json().get('models', [])
+                model_names = [model['name'] for model in models]
+                st.info(f"Available models: {model_names}")
+                if any(name == self.model_name or name.startswith(self.model_name) for name in model_names):
+                    st.success(f"✅ {self.model_name} model is available")
+                    return
+                else:
+                    st.warning(f"⚠️  {self.model_name} model not found, attempting to pull...")
+                    self._pull_model(self.model_name)
+                    return
+        except requests.exceptions.RequestException:
+            st.warning("❌ Ollama is not running, attempting to start...")
+
+        # Try to start Ollama
+        try:
+            st.info("Starting Ollama server...")
+            process = subprocess.Popen(['ollama', 'serve'],
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE,
+                                     start_new_session=True)
+
+            time.sleep(3)
+
+            try:
+                response = requests.get("http://localhost:11434/api/tags", timeout=5)
+                if response.status_code == 200:
+                    st.success("✅ Ollama started successfully")
+                    self._pull_model(self.model_name)
+                    return
+            except requests.exceptions.RequestException:
+                st.error("❌ Failed to start Ollama automatically")
+
+        except FileNotFoundError:
+            st.error("❌ Ollama command not found. Please install Ollama: https://ollama.ai/")
+        except Exception as e:
+            st.error(f"❌ Error starting Ollama: {e}")
+
+        st.warning("⚠️  Ollama setup incomplete. LLM features will not work until Ollama is running with mistral model.")
+
+    def _pull_model(self, model_name: str):
+        """Pull the specified model if not available"""
+        try:
+            st.info(f"Pulling {model_name} model...")
+            process = subprocess.run(['ollama', 'pull', model_name],
+                                   capture_output=True, text=True, timeout=300)
+            if process.returncode == 0:
+                st.success(f"✅ {model_name} model pulled successfully")
+            else:
+                st.error(f"❌ Failed to pull {model_name} model: {process.stderr}")
+        except subprocess.TimeoutExpired:
+            st.error(f"❌ Timeout pulling {model_name} model")
+        except FileNotFoundError:
+            st.error("❌ Ollama command not found")
+        except Exception as e:
+            st.error(f"❌ Error pulling {model_name} model: {e}")
+
+    def _classify_frames(self, text_list: List[str]) -> List[List[Tuple[str, float]]]:
+        """Classify frames for a list of sentences"""
+        if not self.model:
+            return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
+
+        with torch.no_grad():
+            inputs = self.tokenizer(text_list, padding=True, truncation=True, return_tensors="pt").to(self.device)
+            outputs = self.model(**inputs)
+
+            probs = torch.softmax(outputs.logits, dim=-1)
+
+            results = []
+            for prob in probs:
+                top_k = torch.topk(prob, k=2)
+                sentence_frames = []
+                for score, label_index in zip(top_k.values.tolist(), top_k.indices.tolist()):
+                    frame_label = self.label_map.get(label_index, FrameType.OTHER.value)
+                    if score > 0.15:
+                        sentence_frames.append((frame_label, score))
+
+                if not sentence_frames:
+                    sentence_frames.append((FrameType.OTHER.value, 1.0))
+
+                results.append(sentence_frames)
+
+        return results
+
+    def detect_toxicity(self, text: str) -> Dict:
+        """Use Perspective API to detect toxicity"""
+        if not self.perspective_api_key:
+            raise RuntimeError("Perspective API key not configured")
+
+        url = 'https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze'
+        params = {'key': self.perspective_api_key}
+
+        data = {
+            'comment': {'text': text},
+            'languages': ['en'],
+            'requestedAttributes': {
+                'TOXICITY': {},
+                'SEVERE_TOXICITY': {},
+                'INSULT': {},
+                'PROFANITY': {}
+            }
+        }
+
+        response = requests.post(url, params=params, json=data)
+        response.raise_for_status()
+        result = response.json()
+
+        scores = {}
+        for attr in data['requestedAttributes'].keys():
+            scores[attr] = result['attributeScores'][attr]['summaryScore']['value']
+
+        return scores
+
+    def _call_llm(self, prompt: str) -> str:
+        """Call LLM for suggestions - try cloud first, then local"""
+        # Try cloud LLM first
+        if self.llm:
+            try:
+                response = self.llm.invoke(prompt)
+                return response
+            except Exception as e:
+                st.warning(f"Cloud LLM failed: {e}. Trying local Ollama...")
+
+        # Fallback to local Ollama
+        try:
+            payload = {
+                "model": self.model_name,
+                "prompt": prompt,
+                "format": "json",
+                "stream": False
+            }
+            response = requests.post(self.ollama_url, json=payload, timeout=45)
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('response', '')
+            else:
+                st.error(f"Ollama error: {response.status_code} - {response.text}")
+                return ""
+        except Exception as e:
+            st.error(f"LLM error: {e}")
+            return ""
+
+    def analyze_article(self, article_text: str) -> Dict:
+        """Perform sentence-level frame classification for an article"""
+        # Preprocess text to improve sentence tokenization
+        article_text = re.sub(r'\.([A-Za-z])', r'. \1', article_text)
+
+        sentences = sent_tokenize(article_text)
+        if not sentences:
+            return {'sentence_analysis': [], 'article_frames': []}
+
+        sentence_frames_raw = self._classify_frames(sentences)
+
+        sentence_analysis = []
+        all_frames_counts = {}
+        for i, (sent, frames) in enumerate(zip(sentences, sentence_frames_raw)):
+            sentence_analysis.append({
+                'sentence': sent,
+                'frames': [{'label': f[0], 'confidence': f[1]} for f in frames]
+            })
+            for frame, score in frames:
+                all_frames_counts[frame] = all_frames_counts.get(frame, 0) + score
+
+        article_frames_list = sorted([(f, s) for f, s in all_frames_counts.items() if f != FrameType.OTHER.value], key=lambda item: item[1], reverse=True)[:5]
+        article_frames = [{'label': f[0], 'score': f[1]} for f in article_frames_list]
+
+        return {
+            'sentence_analysis': sentence_analysis,
+            'article_frames': article_frames
+        }
+
+    def analyze_comment_with_context(self, comment_text: str, article_analysis: Dict) -> Dict:
+        """
+        Perform frame classification for the comment and compare with article frames.
+        """
+        comment_sentences = sent_tokenize(comment_text)
+        if not comment_sentences:
+             return {
+                'comment_frames': [],
+                'reframing_type': ReframingType.RETENTION.value,
+                'sentence_matches': []
+            }
+
+        comment_frames_raw = self._classify_frames(comment_sentences)
+
+        all_comment_frames = set()
+        for frames in comment_frames_raw:
+            for frame, _ in frames:
+                all_comment_frames.add(frame)
+
+        article_frame_labels = {f['label'] for f in article_analysis['article_frames']}
+        comment_frame_labels = {f for f in all_comment_frames if f != FrameType.OTHER.value}
+
+        reframing_type = self._compare_frames(article_frame_labels, comment_frame_labels)
+
+        comment_frame_counts = {}
+        for frames in comment_frames_raw:
+            for frame, score in frames:
+                if frame != FrameType.OTHER.value:
+                    comment_frame_counts[frame] = comment_frame_counts.get(frame, 0) + score
+
+        sorted_comment_frames = sorted(comment_frame_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+        comment_frames_list = [{'label': f[0], 'score': f[1]} for f in sorted_comment_frames]
+
+        return {
+            'comment_frames': comment_frames_list,
+            'reframing_type': reframing_type.value,
+            'sentence_matches': []
+        }
+
+    def _compare_frames(self, article_frames: set, comment_frames: set) -> ReframingType:
+        """Determine reframing type"""
+        if not comment_frames:
+            return ReframingType.RETENTION
+
+        overlap = article_frames.intersection(comment_frames)
+
+        if len(overlap) == len(comment_frames) and len(overlap) > 0:
+            return ReframingType.RETENTION
+        elif len(overlap) > 0:
+            return ReframingType.SELECTIVE
+        else:
+            return ReframingType.COMPLETE
+
+    def generate_intervention(self, toxicity_scores: Dict, article_text: str, comment_text: str, analysis_results: Dict) -> Dict:
+        """Generate constructive suggestions using LLM only when toxic or reframing detected"""
+        toxicity = toxicity_scores.get('TOXICITY', 0)
+
+        reframing_type = analysis_results.get('reframing_type', ReframingType.RETENTION.value)
+        detected_frames = [f['label'] for f in analysis_results.get('comment_frames', []) if f['label'] != FrameType.OTHER.value]
+
+        needs_intervention = (
+            toxicity > 0.7 or
+            (toxicity > 0.4 and reframing_type in [ReframingType.COMPLETE.value, ReframingType.SELECTIVE.value]) or
+            reframing_type == ReframingType.COMPLETE.value
+        )
+
+        risk_level = 'low'
+        if toxicity > 0.7 or (toxicity > 0.5 and reframing_type == ReframingType.COMPLETE.value):
+            risk_level = 'high'
+        elif toxicity > 0.4 or reframing_type in [ReframingType.SELECTIVE.value, ReframingType.COMPLETE.value]:
+            risk_level = 'medium'
+
+        allow_post = toxicity < 0.8 and reframing_type != ReframingType.COMPLETE.value
+
+        if not needs_intervention:
+            return {
+                'risk_level': risk_level,
+                'toxicity_score': round(toxicity, 2),
+                'reframing_type': reframing_type,
+                'detected_frames': [(f['label'], f['score']) for f in analysis_results.get('comment_frames', []) if f['label'] != FrameType.OTHER.value],
+                'suggestions': [],
+                'allow_post': allow_post,
+                'intervention_reason': 'Comment is not toxic and maintains article frame alignment'
+            }
+
+        context_lines = [
+            f"Toxicity Score: {toxicity:.2f}",
+            f"Reframing Type: {reframing_type}",
+            f"Detected Frames in Comment: {', '.join(detected_frames) if detected_frames else 'None'}",
+            f"Intervention Trigger: {'High toxicity' if toxicity > 0.7 else 'Complete reframing' if reframing_type == ReframingType.COMPLETE.value else 'Moderate toxicity with reframing'}"
+        ]
+
+        json_template = json.dumps({
+            "risk_level": "low|medium|high",
+            "suggestions": ["suggestion1", "suggestion2"],
+            "allow_post": "true|false"
+        }, indent=2)
+
+        prompt = f"""You are an AI comment moderator. Analyze this comment for toxicity and frame transfer (reframing). Provide constructive suggestions only when the comment is toxic or uses a completely different perspective from the article.
+
+CONTEXT:
+{chr(10).join(context_lines)}
+
+Article Excerpt: {article_text[:500]}...
+
+Comment to Analyze: {comment_text}
+
+This comment requires intervention due to: {'high toxicity' if toxicity > 0.7 else 'complete reframing' if reframing_type == ReframingType.COMPLETE.value else 'moderate toxicity with reframing'}
+
+Based on toxicity and frame transfer analysis:
+1. Confirm the risk level (low, medium, high) based on toxicity and reframing.
+2. Provide 2-3 specific, constructive reformulations that:
+   - Reduce toxicity if present
+   - Help align the comment with article frames if reframing is detected
+   - Maintain the core message while improving constructiveness
+3. Determine if the original comment should be allowed to be posted.
+
+Provide a JSON response with the following structure:
+{json_template}"""
+
+        response = self._call_llm(prompt)
+        if not response:
+            raise RuntimeError("LLM returned empty response")
+
+        cleaned_response = response.strip()
+        if cleaned_response.startswith('```json'):
+            cleaned_response = cleaned_response[7:]
+        if cleaned_response.startswith('```'):
+            cleaned_response = cleaned_response[3:]
+        if cleaned_response.endswith('```'):
+            cleaned_response = cleaned_response[:-3]
+        cleaned_response = cleaned_response.strip()
+
+        try:
+            result = json.loads(cleaned_response)
+            final_risk_level = result.get('risk_level', risk_level)
+            final_suggestions = result.get('suggestions', [])
+            final_allow_post = result.get('allow_post', allow_post)
+        except (json.JSONDecodeError, ValueError) as e:
+            st.error(f"LLM response parsing failed: {e}")
+            final_risk_level = risk_level
+            final_suggestions = []
+            final_allow_post = allow_post
+
+        return {
+            'risk_level': final_risk_level,
+            'toxicity_score': round(toxicity, 2),
+            'reframing_type': reframing_type,
+            'detected_frames': [(f['label'], f['score']) for f in analysis_results.get('comment_frames', []) if f['label'] != FrameType.OTHER.value],
+            'suggestions': [{'type': 'Constructive Rephrase', 'message': s} for s in final_suggestions],
+            'allow_post': final_allow_post,
+            'intervention_reason': f"Intervention due to: {'high toxicity' if toxicity > 0.7 else 'complete reframing' if reframing_type == ReframingType.COMPLETE.value else 'moderate toxicity with reframing'}"
+        }
+
+# ============================================
+# STREAMLIT APP
+# ============================================
+
+def main():
+    st.set_page_config(
+        page_title="🤖 Frame-Based Moderation Agent",
+        page_icon="🤖",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+    # Initialize session state
+    if 'news_client' not in st.session_state:
+        st.session_state.news_client = NewsScraperClient()
+    if 'agent' not in st.session_state:
+        st.session_state.agent = AIAgent()
+    if 'articles' not in st.session_state:
+        st.session_state.articles = []
+    if 'selected_article' not in st.session_state:
+        st.session_state.selected_article = None
+    if 'analysis_result' not in st.session_state:
+        st.session_state.analysis_result = None
+
+    # Header
+    st.title("🤖 Frame-Based Moderation Agent")
+    st.markdown("*Toxicity detection + LLM-based constructive suggestions*")
+
+    # Sidebar for navigation
+    with st.sidebar:
+        st.header("📰 News Browser")
+
+        # Search functionality
+        search_query = st.text_input("Search articles:", placeholder="e.g., Trump, Climate, AI...")
+        if st.button("🔍 Search", use_container_width=True):
+            if search_query:
+                with st.spinner("Searching articles..."):
+                    st.session_state.articles = st.session_state.news_client.search_articles(search_query, limit=5)
+                    if st.session_state.articles:
+                        st.session_state.selected_article = st.session_state.articles[0]
+                    st.rerun()
+
+        # Load recent articles
+        if st.button("📡 Load Recent Articles", use_container_width=True):
+            with st.spinner("Fetching articles..."):
+                st.session_state.articles = st.session_state.news_client.fetch_articles(limit=10)
+                if st.session_state.articles:
+                    st.session_state.selected_article = st.session_state.articles[0]
+                st.rerun()
+
+        # Article selection
+        if st.session_state.articles:
+            st.subheader("Articles")
+            article_titles = [f"{i+1}. {article['title'][:50]}..." for i, article in enumerate(st.session_state.articles)]
+            selected_idx = st.selectbox(
+                "Select article:",
+                range(len(st.session_state.articles)),
+                format_func=lambda x: article_titles[x],
+                index=0 if st.session_state.selected_article else 0
+            )
+            if selected_idx is not None:
+                st.session_state.selected_article = st.session_state.articles[selected_idx]
+
+    # Main content area
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.header("📖 Article Content")
+
+        if st.session_state.selected_article:
+            article = st.session_state.selected_article
+
+            st.subheader(article['title'])
+            st.caption(f"Source: {article['source']} • {datetime.fromisoformat(article['published_at']).strftime('%Y-%m-%d %H:%M')}")
+
+            # Analyze article frames if not already done
+            if 'frame_analysis' not in article:
+                with st.spinner("Analyzing article frames..."):
+                    article['frame_analysis'] = st.session_state.agent.analyze_article(article.get('content', ''))
+
+            # Display frames
+            if article.get('frame_analysis', {}).get('article_frames'):
+                st.subheader("🎯 Core Article Frames")
+                frames_html = ""
+                for frame in article['frame_analysis']['article_frames'][:3]:
+                    frames_html += f'<span style="background:#e3f2fd; color:#1565c0; padding:4px 8px; border-radius:12px; margin:2px; display:inline-block;">{frame["label"]}</span>'
+                st.markdown(frames_html, unsafe_allow_html=True)
+
+            # Article content
+            st.text_area(
+                "Article Text:",
+                article.get('content', 'No content available'),
+                height=300,
+                disabled=True
+            )
+
+            # Article URL
+            if article.get('url'):
+                st.markdown(f"[Read full article]({article['url']})")
+        else:
+            st.info("👈 Select or search for articles in the sidebar")
+
+    with col2:
+        st.header("💬 Comment Analysis")
+
+        if st.session_state.selected_article:
+            # Comment input
+            comment_text = st.text_area(
+                "Enter your comment:",
+                placeholder="Share your thoughts on this article...",
+                height=150
+            )
+
+            if st.button("🔍 Analyze Comment", use_container_width=True, type="primary"):
+                if comment_text.strip():
+                    with st.spinner("Analyzing comment for toxicity and frame alignment..."):
+                        try:
+                            # Detect toxicity
+                            toxicity_scores = st.session_state.agent.detect_toxicity(comment_text)
+
+                            # Analyze comment with context
+                            comment_analysis = st.session_state.agent.analyze_comment_with_context(
+                                comment_text,
+                                st.session_state.selected_article['frame_analysis']
+                            )
+
+                            # Generate intervention
+                            intervention = st.session_state.agent.generate_intervention(
+                                toxicity_scores,
+                                st.session_state.selected_article.get('content', ''),
+                                comment_text,
+                                comment_analysis
+                            )
+
+                            # Combine results
+                            st.session_state.analysis_result = {**comment_analysis, **intervention}
+                            st.session_state.analysis_result['detected_frames'] = [
+                                (f['label'], f['score']) for f in st.session_state.analysis_result['comment_frames']
+                            ]
+                            if 'comment_frames' in st.session_state.analysis_result:
+                                del st.session_state.analysis_result['comment_frames']
+
+                        except Exception as e:
+                            st.error(f"Analysis failed: {str(e)}")
+                else:
+                    st.warning("Please enter a comment to analyze")
+
+            # Display results
+            if st.session_state.analysis_result:
+                result = st.session_state.analysis_result
+
+                # Risk level badge
+                risk_colors = {'low': 'green', 'medium': 'orange', 'high': 'red'}
+                st.markdown(f"""
+                <div style="background:{'lightgreen' if result['risk_level'] == 'low' else 'lightyellow' if result['risk_level'] == 'medium' else 'lightcoral'};
+                     padding:15px; border-radius:10px; border-left:5px solid {risk_colors[result['risk_level']]};">
+                    <h3 style="margin:0; color:{risk_colors[result['risk_level']]};">⚠️ RISK LEVEL: {result['risk_level'].upper()}</h3>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Metrics
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    st.metric("Toxicity Score", f"{int(result['toxicity_score'] * 100)}%")
+                with col_b:
+                    st.metric("Reframing Type", result['reframing_type'])
+                with col_c:
+                    status = "✅ ALLOWED" if result['allow_post'] else "❌ REFUSED"
+                    st.metric("AI Recommendation", status)
+
+                # Detected frames
+                if result.get('detected_frames'):
+                    st.subheader("🎯 Detected Frames in Comment")
+                    frame_html = ""
+                    for frame_label, score in result['detected_frames']:
+                        frame_html += f'<span style="background:#f3e5f5; color:#6a1b9a; padding:4px 8px; border-radius:12px; margin:2px; display:inline-block;">{frame_label} ({score:.1%})</span>'
+                    st.markdown(frame_html, unsafe_allow_html=True)
+
+                # Suggestions
+                if result.get('suggestions'):
+                    st.subheader("💡 AI Reformulation Suggestions")
+                    for suggestion in result['suggestions']:
+                        st.info(f"**{suggestion['type']}:** {suggestion['message']}")
+                else:
+                    st.success("✅ No reformulation needed - comment is appropriate!")
+
+                # Intervention reason
+                if result.get('intervention_reason'):
+                    st.caption(f"*{result['intervention_reason']}*")
+        else:
+            st.info("Select an article first to analyze comments")
+
+    # Footer
+    st.markdown("---")
+    st.caption("Built with Streamlit • Powered by AI for constructive discourse")
+
+if __name__ == "__main__":
+    main()
