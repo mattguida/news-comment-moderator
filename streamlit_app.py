@@ -316,7 +316,22 @@ class AIAgent:
 
         if self.model and self.model.config.id2label:
             hf_labels = list(self.model.config.id2label.values())
-            self.label_map = {i: next((ft.value for ft in FrameType if ft.value.lower().startswith(hf_labels[i].split('_')[0].lower())), FrameType.OTHER.value) for i in range(len(hf_labels))}
+            # Create a more robust mapping that handles mismatched label counts
+            num_labels = min(len(hf_labels), len(FrameType))
+            self.label_map = {}
+            for i in range(num_labels):
+                hf_label = hf_labels[i]
+                # Try to match with FrameType values
+                frame_match = next((ft.value for ft in FrameType if ft.value.lower().startswith(hf_label.split('_')[0].lower())), None)
+                if frame_match:
+                    self.label_map[i] = frame_match
+                else:
+                    self.label_map[i] = FrameType.OTHER.value
+
+            # Fill remaining slots with OTHER if model has more labels than FrameType
+            for i in range(num_labels, len(hf_labels)):
+                self.label_map[i] = FrameType.OTHER.value
+
             st.info(f"Using HuggingFace label map: {self.label_map}")
 
         # Initialize LangChain for cloud LLM
