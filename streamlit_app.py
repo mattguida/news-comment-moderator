@@ -297,7 +297,14 @@ class AIAgent:
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.FRAME_MODEL)
             self.model = AutoModelForSequenceClassification.from_pretrained(self.FRAME_MODEL, num_labels=len(FrameType))
-            self.model.to(self.device)
+
+            # Fix for meta tensor issue - use to_empty() instead of to() when moving from meta device
+            if self.device.type != 'meta':
+                if hasattr(self.model, 'to_empty'):
+                    self.model = self.model.to_empty(device=self.device)
+                else:
+                    self.model = self.model.to(self.device)
+
             self.model.eval()
         except Exception as e:
             st.error(f"ERROR LOADING HF MODEL: {e}. Frame classification will be mocked.")
@@ -314,16 +321,45 @@ class AIAgent:
 
         # Initialize LangChain for cloud LLM
         try:
-            self.llm = HuggingFaceEndpoint(
-                repo_id="google/gemma-2-2b-it",
-                huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
-                temperature=0.7,
-                max_new_tokens=512,
-                task="conversational"
-            )
-            st.success("Gemma 2B LLM initialized successfully")
+            # Try multiple models in order of preference for conversational tasks
+            models_to_try = [
+                "microsoft/DialoGPT-medium",
+                "facebook/blenderbot-400M-distill",
+                "google/flan-t5-base"
+            ]
+
+            self.llm = None
+            for model_id in models_to_try:
+                try:
+                    self.llm = HuggingFaceEndpoint(
+                        repo_id=model_id,
+                        huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
+                        temperature=0.7,
+                        max_new_tokens=512,
+                        task="text-generation"  # Use text-generation for these models
+                    )
+                    st.success(f"LLM {model_id} initialized successfully")
+                    break
+                except Exception as model_error:
+                    st.warning(f"Failed to load {model_id}: {model_error}")
+                    continue
+
+            if not self.llm:
+                # Fallback to a simpler initialization without task specification
+                try:
+                    self.llm = HuggingFaceEndpoint(
+                        repo_id="microsoft/DialoGPT-medium",
+                        huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
+                        temperature=0.7,
+                        max_new_tokens=512
+                    )
+                    st.success("LLM initialized successfully (fallback mode)")
+                except Exception as fallback_error:
+                    st.warning(f"All LLM initialization attempts failed: {fallback_error}. Check HUGGINGFACE_API_TOKEN.")
+                    self.llm = None
+
         except Exception as e:
-            st.warning(f"Gemma LLM initialization failed: {e}. Check HUGGINGFACE_API_TOKEN.")
+            st.warning(f"LLM initialization failed: {e}. Check HUGGINGFACE_API_TOKEN.")
             self.llm = None
 
 
@@ -397,7 +433,7 @@ class AIAgent:
 
         try:
             # Log for debugging (remove in production)
-            st.info(f"Calling Gemma LLM with prompt length: {len(prompt)} characters")
+            st.info(f"Calling LLM with prompt length: {len(prompt)} characters")
 
             response = self.llm.invoke(prompt)
 
