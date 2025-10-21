@@ -295,19 +295,38 @@ class AIAgent:
 
         # Add try-except for robust loading
         try:
+            st.info(f"Loading frame classification model: {self.FRAME_MODEL}")
             self.tokenizer = AutoTokenizer.from_pretrained(self.FRAME_MODEL)
-            self.model = AutoModelForSequenceClassification.from_pretrained(self.FRAME_MODEL, num_labels=len(FrameType))
 
-            # Fix for meta tensor issue - use to_empty() instead of to() when moving from meta device
-            if self.device.type != 'meta':
-                if hasattr(self.model, 'to_empty'):
+            # Load model with explicit configuration to avoid meta tensor issues
+            st.info("Loading model configuration...")
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                self.FRAME_MODEL,
+                num_labels=len(FrameType),
+                torch_dtype=torch.float32,  # Explicitly set dtype
+                low_cpu_mem_usage=True
+            )
+
+            # Move to device more carefully
+            st.info(f"Moving model to device: {self.device}")
+            try:
+                if hasattr(self.model, 'to_empty') and self.device.type != 'cpu':
                     self.model = self.model.to_empty(device=self.device)
                 else:
                     self.model = self.model.to(self.device)
+            except Exception as device_error:
+                st.warning(f"Device placement failed: {device_error}. Using CPU.")
+                self.model = self.model.to(torch.device("cpu"))
+                self.device = torch.device("cpu")
 
             self.model.eval()
+            st.success("✅ Frame classification model loaded successfully")
+
         except Exception as e:
             st.error(f"ERROR LOADING HF MODEL: {e}. Frame classification will be mocked.")
+            st.error(f"Model: {self.FRAME_MODEL}")
+            st.error(f"Device: {self.device}")
+            st.error(f"Available devices: CUDA={torch.cuda.is_available()}, MPS={torch.backends.mps.is_available()}")
             self.tokenizer = None
             self.model = None
 
@@ -381,47 +400,104 @@ class AIAgent:
     def _classify_frames(self, text_list: List[str]) -> List[List[Tuple[str, float]]]:
         """Classify frames for a list of sentences"""
         if not self.model or not self.tokenizer:
+            st.warning("Frame classification model not available, using fallback")
             return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
 
         try:
+            # Validate inputs
+            if not text_list or len(text_list) == 0:
+                return [[(FrameType.OTHER.value, 1.0)]]
+
+            # Clean and prepare text
+            clean_texts = [str(text).strip() for text in text_list if str(text).strip()]
+            if not clean_texts:
+                return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
+
+            st.info(f"Classifying {len(clean_texts)} sentences with frame model")
+
             with torch.no_grad():
-                inputs = self.tokenizer(text_list, padding=True, truncation=True, return_tensors="pt")
+                # Tokenize with error handling
+                try:
+                    inputs = self.tokenizer(
+                        clean_texts,
+                        padding=True,
+                        truncation=True,
+                        return_tensors="pt",
+                        max_length=512
+                    )
+                except Exception as tokenize_error:
+                    st.error(f"Tokenization failed: {tokenize_error}")
+                    return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
+
+                # Move inputs to device
                 if self.device.type != 'cpu':
-                    inputs = inputs.to(self.device)
+                    try:
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    except Exception as device_error:
+                        st.warning(f"Device transfer failed: {device_error}. Using CPU.")
+                        inputs = {k: v.to('cpu') for k, v in inputs.items()}
 
-                outputs = self.model(**inputs)
-                logits = outputs.logits
+                # Model inference with detailed error handling
+                try:
+                    outputs = self.model(**inputs)
+                    logits = outputs.logits
+                except Exception as model_error:
+                    st.error(f"Model inference failed: {model_error}")
+                    st.error(f"Input shapes: {[v.shape for v in inputs.values()]}")
+                    st.error(f"Model device: {next(self.model.parameters()).device}")
+                    return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
 
-                # Handle different model output formats
-                if hasattr(logits, 'cpu'):
-                    logits = logits.cpu()
+                # Handle logits
+                try:
+                    if hasattr(logits, 'cpu'):
+                        logits = logits.cpu()
+                    elif self.device.type != 'cpu':
+                        logits = logits.to('cpu')
+                except Exception as logits_error:
+                    st.warning(f"Logits processing failed: {logits_error}")
 
-                probs = torch.softmax(logits, dim=-1)
+                # Calculate probabilities
+                try:
+                    probs = torch.softmax(logits, dim=-1)
+                except Exception as softmax_error:
+                    st.error(f"Softmax failed: {softmax_error}")
+                    return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
 
+                # Process results
                 results = []
-                for prob in probs:
-                    top_k = torch.topk(prob, k=min(2, len(prob)))
-                    sentence_frames = []
+                for i, prob in enumerate(probs):
+                    try:
+                        # Get top k predictions
+                        top_k = torch.topk(prob, k=min(2, len(prob)))
+                        sentence_frames = []
 
-                    for score, label_index in zip(top_k.values.tolist(), top_k.indices.tolist()):
-                        # Validate label_index is within expected range
-                        if 0 <= label_index < len(self.label_map):
-                            frame_label = self.label_map.get(label_index, FrameType.OTHER.value)
-                        else:
-                            frame_label = FrameType.OTHER.value
+                        for score, label_index in zip(top_k.values.tolist(), top_k.indices.tolist()):
+                            # Validate label_index
+                            if 0 <= label_index < len(self.label_map):
+                                frame_label = self.label_map.get(label_index, FrameType.OTHER.value)
+                            else:
+                                st.warning(f"Label index {label_index} out of range [0, {len(self.label_map)})")
+                                frame_label = FrameType.OTHER.value
 
-                        if score > 0.15:
-                            sentence_frames.append((frame_label, score))
+                            if score > 0.15:
+                                sentence_frames.append((frame_label, score))
 
-                    if not sentence_frames:
-                        sentence_frames.append((FrameType.OTHER.value, 1.0))
+                        if not sentence_frames:
+                            sentence_frames.append((FrameType.OTHER.value, 1.0))
 
-                    results.append(sentence_frames)
+                        results.append(sentence_frames)
 
+                    except Exception as prob_error:
+                        st.error(f"Processing probabilities failed for sentence {i}: {prob_error}")
+                        results.append([(FrameType.OTHER.value, 1.0)])
+
+                st.success(f"✅ Frame classification completed for {len(results)} sentences")
                 return results
 
         except Exception as e:
-            st.warning(f"Frame classification failed: {e}. Using fallback.")
+            st.error(f"Frame classification failed: {e}. Using fallback.")
+            st.error(f"Text list length: {len(text_list)}")
+            st.error(f"Device: {self.device}")
             return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
 
     def detect_toxicity(self, text: str) -> Dict:
