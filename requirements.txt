@@ -1,0 +1,13 @@
+streamlit
+requests
+nltk
+beautifulsoup4
+lxml
+pydantic
+torch
+transformers
+scipy
+scikit-learn
+langchain
+langchain-community
+langchain-huggingface
