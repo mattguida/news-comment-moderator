@@ -365,30 +365,49 @@ class AIAgent:
 
     def _classify_frames(self, text_list: List[str]) -> List[List[Tuple[str, float]]]:
         """Classify frames for a list of sentences"""
-        if not self.model:
+        if not self.model or not self.tokenizer:
             return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
 
-        with torch.no_grad():
-            inputs = self.tokenizer(text_list, padding=True, truncation=True, return_tensors="pt").to(self.device)
-            outputs = self.model(**inputs)
+        try:
+            with torch.no_grad():
+                inputs = self.tokenizer(text_list, padding=True, truncation=True, return_tensors="pt")
+                if self.device.type != 'cpu':
+                    inputs = inputs.to(self.device)
 
-            probs = torch.softmax(outputs.logits, dim=-1)
+                outputs = self.model(**inputs)
+                logits = outputs.logits
 
-            results = []
-            for prob in probs:
-                top_k = torch.topk(prob, k=2)
-                sentence_frames = []
-                for score, label_index in zip(top_k.values.tolist(), top_k.indices.tolist()):
-                    frame_label = self.label_map.get(label_index, FrameType.OTHER.value)
-                    if score > 0.15:
-                        sentence_frames.append((frame_label, score))
+                # Handle different model output formats
+                if hasattr(logits, 'cpu'):
+                    logits = logits.cpu()
 
-                if not sentence_frames:
-                    sentence_frames.append((FrameType.OTHER.value, 1.0))
+                probs = torch.softmax(logits, dim=-1)
 
-                results.append(sentence_frames)
+                results = []
+                for prob in probs:
+                    top_k = torch.topk(prob, k=min(2, len(prob)))
+                    sentence_frames = []
 
-        return results
+                    for score, label_index in zip(top_k.values.tolist(), top_k.indices.tolist()):
+                        # Validate label_index is within expected range
+                        if 0 <= label_index < len(self.label_map):
+                            frame_label = self.label_map.get(label_index, FrameType.OTHER.value)
+                        else:
+                            frame_label = FrameType.OTHER.value
+
+                        if score > 0.15:
+                            sentence_frames.append((frame_label, score))
+
+                    if not sentence_frames:
+                        sentence_frames.append((FrameType.OTHER.value, 1.0))
+
+                    results.append(sentence_frames)
+
+                return results
+
+        except Exception as e:
+            st.warning(f"Frame classification failed: {e}. Using fallback.")
+            return [[(FrameType.OTHER.value, 1.0)] for _ in text_list]
 
     def detect_toxicity(self, text: str) -> Dict:
         """Use Perspective API to detect toxicity"""
