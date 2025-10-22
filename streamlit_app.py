@@ -5,7 +5,7 @@ Deploy on Streamlit Cloud: https://share.streamlit.io/
 
 import streamlit as st
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 import requests
 import os
 from typing import Dict, List, Tuple
@@ -22,29 +22,8 @@ from scipy.spatial.distance import cosine
 from pydantic import BaseModel
 from typing import List as TypingList
 
-# LangChain imports for cloud LLM
-from langchain_huggingface import HuggingFaceEndpoint
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-
 from nltk.tokenize import sent_tokenize
 nltk.download('punkt_tab')
-
-# ============================================
-# HUGGINGFACE HUB SETUP
-# ============================================
-
-from getpass import getpass
-
-# Setup HuggingFace Hub API token for cloud models
-if not os.getenv('HUGGINGFACE_API_TOKEN'):
-    try:
-        HUGGINGFACE_API_TOKEN = getpass("Enter your HuggingFace Hub API token: ")
-        os.environ["HUGGINGFACE_API_TOKEN"] = HUGGINGFACE_API_TOKEN
-        print("✅ HuggingFace Hub API token set successfully")
-    except Exception as e:
-        print(f"❌ Error setting API token: {e}")
-        print("Please set HUGGINGFACE_API_TOKEN environment variable manually")
 
 
 # ============================================
@@ -369,47 +348,22 @@ class AIAgent:
 
             st.info(f"Using HuggingFace label map: {self.label_map}")
 
-        # Initialize LangChain for cloud LLM
+        # Initialize local LLM pipeline
         try:
-            # Try multiple models in order of preference for conversational tasks
-            models_to_try = [
-                #"facebook/blenderbot-400M-distill",
-                "google/flan-t5-base"
-            ]
-
-            self.llm = None
-            for model_id in models_to_try:
-                try:
-                    self.llm = HuggingFaceEndpoint(
-                        repo_id=model_id,
-                        huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
-                        temperature=0.7,
-                        max_new_tokens=512,
-                        task="text-generation"  # Use text-generation for these models
-                    )
-                    st.success(f"LLM {model_id} initialized successfully")
-                    break
-                except Exception as model_error:
-                    st.warning(f"Failed to load {model_id}: {model_error}")
-                    continue
-
-            if not self.llm:
-                # Fallback to a simpler initialization without task specification
-                try:
-                    self.llm = HuggingFaceEndpoint(
-                        repo_id="google/flan-t5-base",
-                        huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
-                        temperature=0.7,
-                        max_new_tokens=512
-                    )
-                    st.success("LLM initialized successfully (fallback mode)")
-                except Exception as fallback_error:
-                    st.warning(f"All LLM initialization attempts failed: {fallback_error}. Check HUGGINGFACE_API_TOKEN.")
-                    self.llm = None
+            st.info("Loading local LLM: google/gemma-2-2b-it")
+            self.llm_pipe = pipeline(
+                "text-generation",
+                model="google/gemma-2-2b-it",
+                model_kwargs={"torch_dtype": torch.bfloat16},
+                device="cpu",  # replace with "mps" to run on a Mac device
+            )
+            st.success("✅ Local LLM pipeline loaded successfully")
 
         except Exception as e:
-            st.warning(f"LLM initialization failed: {e}. Check HUGGINGFACE_API_TOKEN.")
-            self.llm = None
+            st.error(f"ERROR LOADING LOCAL LLM: {e}. LLM features will be mocked.")
+            st.error(f"Model: google/gemma-2-2b-it")
+            st.error(f"Device: {self.device}")
+            self.llm_pipe = None
 
 
     def _classify_frames(self, text_list: List[str]) -> List[List[Tuple[str, float]]]:
@@ -545,32 +499,39 @@ class AIAgent:
         return scores
 
     def _call_llm(self, prompt: str) -> str:
-        """Call HuggingFace cloud LLM for suggestions"""
-        if not self.llm:
-            st.error("LLM not initialized. Please set HUGGINGFACE_API_TOKEN environment variable.")
-            return ""
-
-        # Check if API token is available
-        token = os.getenv('HUGGINGFACE_API_TOKEN')
-        if not token:
-            st.error("HUGGINGFACE_API_TOKEN environment variable is not set.")
+        """Call local LLM pipeline for suggestions"""
+        if not self.llm_pipe:
+            st.error("LLM pipeline not initialized. Please check model availability.")
             return ""
 
         try:
             # Log for debugging (remove in production)
-            st.info(f"Calling LLM with prompt length: {len(prompt)} characters")
+            st.info(f"Calling local LLM with prompt length: {len(prompt)} characters")
 
-            response = self.llm.invoke(prompt)
+            # Use the pipeline like in the example
+            messages = [
+                {"role": "user", "content": prompt},
+            ]
 
-            if not response or response.strip() == "":
-                st.warning("LLM returned empty response")
-                return ""
+            outputs = self.llm_pipe(messages, max_new_tokens=256)
 
-            return response
+            # Extract response like in the example
+            if outputs and len(outputs) > 0:
+                generated_text = outputs[0].get("generated_text", "")
+                if isinstance(generated_text, list) and len(generated_text) > 0:
+                    assistant_response = generated_text[-1].get("content", "").strip()
+                else:
+                    assistant_response = str(generated_text).strip()
+
+                if assistant_response:
+                    return assistant_response
+
+            st.warning("LLM returned empty response")
+            return ""
 
         except Exception as e:
             st.error(f"LLM call failed: {str(e)}")
-            st.error("This might be due to: 1) Invalid API token, 2) Model unavailable, 3) Rate limiting, or 4) Network issues")
+            st.error("This might be due to: 1) Model loading issues, 2) GPU memory, 3) Model compatibility")
             return ""
 
     def analyze_article(self, article_text: str) -> Dict:
