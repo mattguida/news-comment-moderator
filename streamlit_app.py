@@ -348,14 +348,28 @@ class AIAgent:
 
             st.info(f"Using HuggingFace label map: {self.label_map}")
 
-        # Initialize local LLM pipeline
+        # Initialize local LLM pipeline with Gemma authentication
         try:
             st.info("Loading local LLM: google/gemma-2-2b-it")
+
+            # For Streamlit Cloud deployment, use token from secrets
+            hf_token = os.getenv('HUGGINGFACE_API_TOKEN')
+
+            if not hf_token:
+                st.error("HUGGINGFACE_API_TOKEN not found. Please set it in Streamlit Cloud secrets.")
+                self.llm_pipe = None
+                return
+
+            # Login to HuggingFace Hub for authenticated models
+            from huggingface_hub import login
+            login(token=hf_token)
+
             self.llm_pipe = pipeline(
                 "text-generation",
                 model="google/gemma-2-2b-it",
                 model_kwargs={"torch_dtype": torch.bfloat16},
-                device="cpu",  # replace with "mps" to run on a Mac device
+                device="cpu",
+                token=hf_token  # Pass token for gated models
             )
             st.success("✅ Local LLM pipeline loaded successfully")
 
@@ -363,6 +377,7 @@ class AIAgent:
             st.error(f"ERROR LOADING LOCAL LLM: {e}. LLM features will be mocked.")
             st.error(f"Model: google/gemma-2-2b-it")
             st.error(f"Device: {self.device}")
+            st.error("Make sure HUGGINGFACE_API_TOKEN is set in Streamlit Cloud secrets")
             self.llm_pipe = None
 
 
