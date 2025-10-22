@@ -381,7 +381,7 @@ class AIAgent:
                 # Fallback to a simpler initialization without task specification
                 try:
                     self.llm = HuggingFaceEndpoint(
-                        repo_id="microsoft/DialoGPT-medium",
+                        repo_id="google/flan-t5-base",
                         huggingfacehub_api_token=os.getenv('HUGGINGFACE_API_TOKEN'),
                         temperature=0.7,
                         max_new_tokens=512
