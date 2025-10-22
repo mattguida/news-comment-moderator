@@ -30,6 +30,22 @@ from langchain_core.output_parsers import JsonOutputParser
 from nltk.tokenize import sent_tokenize
 nltk.download('punkt_tab')
 
+# ============================================
+# HUGGINGFACE HUB SETUP
+# ============================================
+
+from getpass import getpass
+
+# Setup HuggingFace Hub API token for cloud models
+if not os.getenv('HUGGINGFACE_API_TOKEN'):
+    try:
+        HUGGINGFACE_API_TOKEN = getpass("Enter your HuggingFace Hub API token: ")
+        os.environ["HUGGINGFACE_API_TOKEN"] = HUGGINGFACE_API_TOKEN
+        print("✅ HuggingFace Hub API token set successfully")
+    except Exception as e:
+        print(f"❌ Error setting API token: {e}")
+        print("Please set HUGGINGFACE_API_TOKEN environment variable manually")
+
 
 # ============================================
 # CONFIGURATION
