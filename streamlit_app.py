@@ -357,8 +357,7 @@ class AIAgent:
         try:
             # Try multiple models in order of preference for conversational tasks
             models_to_try = [
-                "microsoft/DialoGPT-medium",
-                "facebook/blenderbot-400M-distill",
+                #"facebook/blenderbot-400M-distill",
                 "google/flan-t5-base"
             ]
 
